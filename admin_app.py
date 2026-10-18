@@ -51,6 +51,7 @@ class AdminApp:
         self._photo: tk.PhotoImage | None = None    # prevent GC
         self._current_video:  str | None  = None
         self._current_folder: str | None  = None
+        self._current_id:     int | None  = None
 
         self._apply_styles()
         self._build_ui()
@@ -257,40 +258,97 @@ class AdminApp:
             btns, text="Open Captures Folder",
             style="TButton",
             command=self._open_folder,
-        ).pack(fill="x", ipadx=6, ipady=3)
+        ).pack(fill="x", pady=(0, 6), ipadx=6, ipady=3)
+
+        # Your own verdict on the selected event. Compare it with the AI's
+        # answer later to measure accuracy (see README, "Measuring accuracy").
+        ttk.Button(
+            btns, text="✓  Real person",
+            style="TButton",
+            command=lambda: self._set_review(1),
+        ).pack(fill="x", pady=(0, 4), ipadx=6, ipady=2)
+        ttk.Button(
+            btns, text="✗  False alarm",
+            style="TButton",
+            command=lambda: self._set_review(0),
+        ).pack(fill="x", ipadx=6, ipady=2)
+
+    def _set_review(self, value: int) -> None:
+        """Save the user's label for the selected event."""
+        if self._current_id is None:
+            messagebox.showinfo("No Event", "Select an event first.")
+            return
+        try:
+            with sqlite3.connect(DB_FILE, timeout=10) as conn:
+                conn.execute("UPDATE events SET reviewed=? WHERE id=?",
+                             (value, self._current_id))
+        except sqlite3.Error as exc:
+            messagebox.showerror(
+                "Cannot Save",
+                f"Could not save your review:\n{exc}\n\n"
+                "Run security_cam.py once so the database gets its new columns.",
+            )
+            return
+        self._refresh_events()
 
     # ------------------------------------------------------------------
     # Data loading
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _select_list(conn: sqlite3.Connection, wanted: tuple) -> str:
+        """Column list for a SELECT. Columns an older database lacks read as NULL."""
+        have = {r[1] for r in conn.execute("PRAGMA table_info(events)")}
+        return ", ".join(c if c in have else f"NULL AS {c}" for c in wanted)
+
     def _load_events(self) -> list:
         if not os.path.exists(DB_FILE):
             return []
         try:
-            with sqlite3.connect(DB_FILE) as conn:
+            with sqlite3.connect(DB_FILE, timeout=10) as conn:
+                cols = self._select_list(conn, (
+                    "id", "timestamp", "camera_index", "snapshot_path",
+                    "video_path", "analysis", "box_count",
+                    "ai_person", "ai_confidence", "reviewed",
+                ))
                 return conn.execute(
-                    "SELECT id, timestamp, camera_index, snapshot_path, "
-                    "video_path, analysis, box_count "
-                    "FROM events ORDER BY id DESC"
+                    f"SELECT {cols} FROM events ORDER BY id DESC"
                 ).fetchall()
         except sqlite3.Error:
             return []
+
+    @staticmethod
+    def _verdict_label(ai_person, ai_conf, reviewed) -> str:
+        """Short text for the list: 'Person 85', 'No person 12', plus review mark."""
+        if ai_person is None:
+            label = ""
+        elif ai_person:
+            label = f"Person {ai_conf}"
+        else:
+            label = f"No person {ai_conf}"
+        if reviewed == 1:
+            label += "  ✓"
+        elif reviewed == 0:
+            label += "  ✗ false alarm"
+        return label.strip()
 
     def _refresh_events(self) -> None:
         rows = self._load_events()
         self._tree.delete(*self._tree.get_children())
 
         for row in rows:
-            id_, ts, cam_idx, snap, vid, analysis, boxes = row
+            id_, ts, cam_idx, snap, vid, analysis, boxes, ai_person, ai_conf, reviewed = row
             boxes = boxes or 0
 
-            # Shorten AI analysis to a one-line preview
-            preview = (analysis or "").replace("\n", " ")
+            # List shows the AI score first, then the start of the description.
+            verdict = self._verdict_label(ai_person, ai_conf, reviewed)
+            description = (analysis or "").replace("\n", " ")
+            preview = verdict or description
             if len(preview) > 42:
                 preview = preview[:39] + "…"
 
-            # Only show as "alert" (bright) if box_count > 0 (human-sized blob confirmed)
-            tag = "human" if boxes > 0 else "small"
+            # Bright row = human-sized blob confirmed and the AI did not say "nobody".
+            tag = "human" if boxes > 0 and ai_person != 0 else "small"
 
             self._tree.insert(
                 "", "end",
@@ -315,13 +373,16 @@ class AdminApp:
         if not sel:
             return
         event_id = int(sel[0])
+        self._current_id = event_id
 
         try:
-            with sqlite3.connect(DB_FILE) as conn:
+            with sqlite3.connect(DB_FILE, timeout=10) as conn:
+                cols = self._select_list(conn, (
+                    "timestamp", "camera_index", "snapshot_path",
+                    "video_path", "analysis", "box_count",
+                ))
                 row = conn.execute(
-                    "SELECT timestamp, camera_index, snapshot_path, "
-                    "video_path, analysis, box_count "
-                    "FROM events WHERE id=?",
+                    f"SELECT {cols} FROM events WHERE id=?",
                     (event_id,),
                 ).fetchone()
         except sqlite3.Error:

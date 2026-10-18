@@ -1,0 +1,10 @@
+# Footage, event history and logs are personal data — keep them out of git.
+captures/
+events.db
+events.db-wal
+events.db-shm
+motion_events.log
+
+# Python
+__pycache__/
+*.pyc

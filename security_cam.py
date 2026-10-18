@@ -5,24 +5,31 @@ Usage:
     python security_cam.py
 
 Dependencies:
-    pip install opencv-python
+    pip install -r requirements.txt
+    A running Ollama install with a vision model (see OLLAMA_MODEL in config.py).
 
-All configuration (email credentials, thresholds, etc.) lives in config.py.
+All configuration (thresholds, Ollama model, notifications) lives in config.py.
 """
 
 import base64
 import collections
+import json
 import os
+import queue
 import sqlite3
+import threading
 import time
 import logging
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
 from datetime import datetime
 
 import cv2
 import config
 
-# anthropic is optional — imported lazily inside analyze_appearance().
-# Install with:  pip install anthropic
+# winotify (Windows toast notifications) is optional and imported lazily
+# inside send_notification().
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -255,7 +262,7 @@ def draw_overlay(
     # --- Bounding boxes ---
     for (x, y, bw, bh) in boxes:
         # Draw filled semi-transparent rectangle behind label
-        label_str = "Person" if mode == "person" else ""
+        label_str = "Person" if mode == "human" else ""
         cv2.rectangle(annotated, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
         if label_str:
             lx, ly = x, max(y - 6, 12)
@@ -264,7 +271,7 @@ def draw_overlay(
 
     # --- Status label (top-left) ---
     if alert_active:
-        label  = "!! PERSON DETECTED !!" if mode == "person" else "!! MOTION DETECTED !!"
+        label  = "!! PERSON DETECTED !!" if mode == "human" else "!! MOTION DETECTED !!"
         colour = (0, 0, 255)
     else:
         label  = "Monitoring..."
@@ -301,7 +308,7 @@ def draw_overlay(
 
     # --- AI appearance analysis panel (bottom strip) ---
     if analysis:
-        panel_h = 80
+        panel_h = 100   # fits the verdict line plus three description lines
         panel_y = h_f - panel_h
         # Semi-transparent dark background so text is always readable.
         overlay = annotated.copy()
@@ -353,63 +360,221 @@ class AlertCooldown:
 
 
 # ---------------------------------------------------------------------------
-# AI appearance analysis
+# Local AI analysis (Ollama)
 # ---------------------------------------------------------------------------
 
-def analyze_appearance(image_path: str) -> str:
-    """Send the snapshot to Claude vision and return a description.
+# The model is forced to reply with exactly this JSON shape, so we never have
+# to parse free text.
+OLLAMA_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "person_present": {"type": "boolean"},
+        "confidence":     {"type": "integer"},
+        "clothing":       {"type": "string"},
+        "appearance":     {"type": "string"},
+        "activity":       {"type": "string"},
+    },
+    "required": ["person_present", "confidence", "clothing", "appearance", "activity"],
+}
 
-    Describes clothing, colours, build, and activity in three short lines.
-    Returns an empty string silently if the API key is missing or the call fails.
+OLLAMA_PROMPT = (
+    "This is a frame from a security camera. Decide whether a real, live person "
+    "is visible. Posters, photos, mannequins, reflections and shadows are not people.\n"
+    "Reply with JSON only:\n"
+    "person_present: true or false.\n"
+    "confidence: integer 0 to 100. How sure you are that a real person is visible "
+    "(0 = certainly nobody, 100 = certainly a person).\n"
+    "clothing, appearance, activity: short phrases about the person. "
+    "Use an empty string if nobody is visible."
+)
+
+
+@dataclass
+class AIResult:
+    """Outcome of one analysis. status is 'done', 'failed' or 'skipped'."""
+    status: str
+    person_present: bool | None = None
+    confidence: int | None = None
+    text: str = ""          # human-readable summary shown on screen and in the admin app
+    raw: str = ""           # exact model reply, kept for debugging
+    latency_ms: int | None = None
+    model: str = ""
+    error: str = ""
+
+
+def _encode_snapshot(image_path: str) -> str:
+    """Return the snapshot as a base64 JPEG, shrunk to OLLAMA_IMAGE_WIDTH."""
+    img = cv2.imread(image_path)
+    if img is None:
+        raise RuntimeError(f"Cannot read snapshot '{image_path}'")
+    h, w = img.shape[:2]
+    target_w = int(config.OLLAMA_IMAGE_WIDTH)
+    if w > target_w:
+        img = cv2.resize(img, (target_w, max(1, int(h * target_w / w))),
+                         interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if not ok:
+        raise RuntimeError("Could not encode snapshot as JPEG")
+    return base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+def _format_analysis(person: bool, confidence: int, data: dict) -> str:
+    lines = [f"Person: {'yes' if person else 'no'} ({confidence}/100)"]
+    for key in ("clothing", "appearance", "activity"):
+        value = str(data.get(key) or "").strip()
+        if value:
+            lines.append(f"{key.capitalize()}: {value}")
+    return "\n".join(lines)
+
+
+def analyze_snapshot(image_path: str) -> AIResult:
+    """Ask the local Ollama vision model about the snapshot.
+
+    Never raises: any problem (Ollama off, timeout, bad reply) comes back as
+    an AIResult with status 'failed' so the caller can decide what to do.
     """
-    if not getattr(config, "ANALYZE_APPEARANCE", False):
-        return ""
-    api_key = getattr(config, "ANTHROPIC_API_KEY", "")
-    if not api_key or api_key.startswith("your-"):
-        log.warning("ANTHROPIC_API_KEY not set — skipping appearance analysis.")
-        return ""
+    model = config.OLLAMA_MODEL
+    if not config.ANALYZE_APPEARANCE:
+        return AIResult(status="skipped", model=model)
 
+    started = time.time()
+    raw = ""
     try:
-        import anthropic as _anthropic
-
-        with open(image_path, "rb") as f:
-            img_b64 = base64.standard_b64encode(f.read()).decode("utf-8")
-
-        client = _anthropic.Anthropic(api_key=api_key)
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",  # cheapest model — good for testing
-            max_tokens=300,
-            messages=[{
+        payload = {
+            "model": model,
+            "stream": False,
+            "think": bool(config.OLLAMA_THINK),
+            "format": OLLAMA_SCHEMA,
+            "keep_alive": config.OLLAMA_KEEP_ALIVE,
+            "options": {"temperature": 0},
+            "messages": [{
                 "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": img_b64,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "Security camera frame. A person has been detected. "
-                            "Describe them in exactly three short lines, no preamble:\n"
-                            "Clothing: <colors and garment types>\n"
-                            "Appearance: <build, hair, accessories>\n"
-                            "Activity: <what they appear to be doing>"
-                        ),
-                    },
-                ],
+                "content": OLLAMA_PROMPT,
+                "images": [_encode_snapshot(image_path)],
             }],
+        }
+        req = urllib.request.Request(
+            config.OLLAMA_URL.rstrip("/") + "/api/chat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
-        text = next((b.text for b in response.content if b.type == "text"), "").strip()
-        log.info("Appearance analysis: %s", text.replace("\n", " | "))
-        return text
+        with urllib.request.urlopen(req, timeout=config.OLLAMA_TIMEOUT) as resp:
+            body = json.load(resp)
 
+        raw = (body.get("message") or {}).get("content", "") or ""
+        data = json.loads(raw)
+        person = bool(data["person_present"])
+        confidence = max(0, min(100, int(data["confidence"])))
+        latency = int((time.time() - started) * 1000)
+        text = _format_analysis(person, confidence, data)
+        log.info("AI verdict (%d ms): %s", latency, text.replace("\n", " | "))
+        return AIResult("done", person, confidence, text, raw, latency, model)
+
+    except Exception as exc:     # network, timeout, bad JSON, missing key, unreadable image
+        latency = int((time.time() - started) * 1000)
+        log.warning("AI analysis failed after %d ms: %s", latency, exc)
+        return AIResult("failed", raw=raw, latency_ms=latency, model=model, error=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Notification
+# ---------------------------------------------------------------------------
+
+def should_notify(result: AIResult) -> bool:
+    """Decide whether this AI result deserves a notification."""
+    if result.status == "done":
+        return bool(result.person_present) and (
+            result.confidence or 0) >= config.PERSON_CONFIDENCE_THRESHOLD
+    # 'skipped' (AI turned off) and 'failed' (Ollama problem) fall back to the setting.
+    if result.status == "skipped":
+        return True
+    return bool(config.NOTIFY_ON_AI_FAILURE)
+
+
+def send_notification(title: str, message: str, image_path: str | None) -> None:
+    """Show a desktop toast and beep. Every part is best-effort and never raises."""
+    if config.SOUND_ALERT:
+        play_alert_sound()
+    if not config.NOTIFY_DESKTOP:
+        return
+    try:
+        from winotify import Notification      # Windows only
+        icon = os.path.abspath(image_path) if image_path else ""
+        toast = Notification(app_id="Security Cam", title=title, msg=message, icon=icon)
+        toast.show()
+    except ImportError:
+        log.warning("winotify not installed (pip install winotify) — no desktop toast.")
     except Exception as exc:
-        log.warning("Appearance analysis failed: %s", exc)
-        return ""
+        log.warning("Desktop notification failed: %s", exc)
+
+
+class LatestText:
+    """Thread-safe holder for the newest AI description (shown on the live feed)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._text = ""
+
+    def set(self, text: str) -> None:
+        with self._lock:
+            self._text = text
+
+    def get(self) -> str:
+        with self._lock:
+            return self._text
+
+
+class AnalysisWorker(threading.Thread):
+    """Runs the slow AI call off the camera loop.
+
+    The main loop calls submit() and carries on at full frame rate. This thread
+    asks Ollama, saves the verdict to the database, and sends the notification.
+    """
+
+    def __init__(self, latest: LatestText) -> None:
+        super().__init__(name="ai-worker", daemon=True)
+        self._queue: queue.Queue = queue.Queue(maxsize=int(config.AI_QUEUE_SIZE))
+        self._latest = latest
+
+    def submit(self, event_id: int | None, snapshot_path: str) -> None:
+        try:
+            self._queue.put_nowait((event_id, snapshot_path))
+        except queue.Full:
+            log.warning("AI queue full — event %s saved without analysis.", event_id)
+            self._finish(event_id, snapshot_path,
+                         AIResult("failed", model=config.OLLAMA_MODEL,
+                                  error="AI queue full"))
+
+    def stop(self, wait: float = 5.0) -> None:
+        self._queue.put(None)
+        self.join(timeout=wait)
+
+    def run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            event_id, snapshot_path = item
+            self._finish(event_id, snapshot_path, analyze_snapshot(snapshot_path))
+
+    def _finish(self, event_id: int | None, snapshot_path: str, result: AIResult) -> None:
+        notify = should_notify(result)
+        if result.text:
+            self._latest.set(result.text)
+        if event_id is not None:
+            update_event_ai(event_id, result, notified=notify)
+        if notify:
+            if result.status == "done":
+                title = f"Person detected ({result.confidence}/100)"
+            else:
+                title = "Movement detected (AI check unavailable)"
+            send_notification(title, result.text or "Open the dashboard to review.",
+                              snapshot_path)
+        else:
+            log.info("No notification: AI says person_present=%s confidence=%s (threshold %d).",
+                     result.person_present, result.confidence,
+                     config.PERSON_CONFIDENCE_THRESHOLD)
 
 
 def _draw_wrapped(img, text: str, x: int, y: int, max_w: int,
@@ -468,10 +633,33 @@ def log_motion_event(log_file: str, snapshot_path: str | None, video_path: str |
 
 DB_FILE = "events.db"
 
+# Columns added for the Ollama analysis. Databases created by older versions
+# get them added automatically by init_db().
+AI_COLUMNS = {
+    "ai_status":     "TEXT DEFAULT 'pending'",  # pending | done | failed | skipped
+    "ai_person":     "INTEGER",                 # 1 person, 0 nobody, NULL unknown
+    "ai_confidence": "INTEGER",                 # 0-100
+    "ai_model":      "TEXT",
+    "ai_latency_ms": "INTEGER",
+    "ai_raw":        "TEXT",                    # exact model reply or error text
+    "notified":      "INTEGER DEFAULT 0",       # 1 if a notification was sent
+    "reviewed":      "INTEGER",                 # human label: 1 correct, 0 false alarm
+}
+
+
+def _connect() -> sqlite3.Connection:
+    """Open a new connection. Each thread must use its own."""
+    return sqlite3.connect(DB_FILE, timeout=10)
+
+
+def _db_path(path: str | None) -> str | None:
+    """Store paths with forward slashes so they work on any OS."""
+    return path.replace("\\", "/") if path else path
+
 
 def init_db() -> None:
-    """Create the events table if it does not already exist."""
-    with sqlite3.connect(DB_FILE) as conn:
+    """Create the events table and add any missing AI columns."""
+    with _connect() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS events (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -483,6 +671,13 @@ def init_db() -> None:
                 box_count     INTEGER DEFAULT 0
             )
         """)
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+        for name, ddl in AI_COLUMNS.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE events ADD COLUMN {name} {ddl}")
+                log.info("Database: added column %s", name)
+        # WAL lets the admin app read while the camera writes.
+        conn.execute("PRAGMA journal_mode=WAL")
 
 
 def save_event_to_db(
@@ -492,18 +687,40 @@ def save_event_to_db(
     video_path: str | None,
     analysis: str,
     box_count: int,
-) -> None:
-    """Insert one detection event into the database."""
+) -> int | None:
+    """Insert one detection event and return its row id (None if saving failed)."""
+    status = "pending" if config.ANALYZE_APPEARANCE else "skipped"
     try:
-        with sqlite3.connect(DB_FILE) as conn:
-            conn.execute(
+        with _connect() as conn:
+            cur = conn.execute(
                 "INSERT INTO events "
-                "(timestamp, camera_index, snapshot_path, video_path, analysis, box_count) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (timestamp, camera_index, snapshot_path, video_path, analysis, box_count),
+                "(timestamp, camera_index, snapshot_path, video_path, analysis, "
+                " box_count, ai_status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (timestamp, camera_index, _db_path(snapshot_path),
+                 _db_path(video_path), analysis, box_count, status),
             )
+            return cur.lastrowid
     except sqlite3.Error as exc:
         log.warning("Could not save event to database: %s", exc)
+        return None
+
+
+def update_event_ai(event_id: int, result: "AIResult", notified: bool) -> None:
+    """Write the AI verdict (and whether we notified) onto an existing event."""
+    person = None if result.person_present is None else int(result.person_present)
+    raw = result.raw or result.error
+    try:
+        with _connect() as conn:
+            conn.execute(
+                "UPDATE events SET analysis=?, ai_status=?, ai_person=?, "
+                "ai_confidence=?, ai_model=?, ai_latency_ms=?, ai_raw=?, notified=? "
+                "WHERE id=?",
+                (result.text, result.status, person, result.confidence,
+                 result.model, result.latency_ms, raw, int(notified), event_id),
+            )
+    except sqlite3.Error as exc:
+        log.warning("Could not update event %s with AI result: %s", event_id, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +788,9 @@ def run() -> None:
     log.info("Monitoring started.  Press Q in the camera window to quit.")
 
     persist_count   = 0    # consecutive frames with a confirmed detection
-    last_analysis   = ""   # most recent AI appearance description
+    latest_analysis = LatestText()   # newest AI description, shown on the live feed
+    worker = AnalysisWorker(latest_analysis)
+    worker.start()
 
     try:
         while True:
@@ -639,14 +858,11 @@ def run() -> None:
             # --- Handle alert ---
             if alert_triggered and cooldown.is_ready():
                 event_count += 1
-                what = "person(s)" if mode == "person" else "motion"
+                what = "person(s)" if mode == "human" else "motion"
                 log.info(
                     "%s confirmed (%d consecutive frames, %d box(es)) — event #%d",
                     what.capitalize(), persist_count, len(boxes), event_count,
                 )
-
-                if config.SOUND_ALERT:
-                    play_alert_sound()
 
                 snapshot_path = None
                 try:
@@ -655,18 +871,19 @@ def run() -> None:
                     log.error("Snapshot error: %s", exc)
 
                 if snapshot_path:
-                    last_analysis = analyze_appearance(snapshot_path)
-
                     video_path = recorder.filepath if (recorder and recorder.is_recording) else None
 
-                    save_event_to_db(
+                    # Save the event first, then let the background worker fill
+                    # in the AI verdict and send the notification.
+                    event_id = save_event_to_db(
                         timestamp=datetime.now().isoformat(timespec="seconds"),
                         camera_index=config.CAMERA_INDEX,
                         snapshot_path=snapshot_path,
                         video_path=video_path,
-                        analysis=last_analysis,
+                        analysis="",
                         box_count=len(boxes),
                     )
+                    worker.submit(event_id, snapshot_path)
 
                     if config.SAVE_EVENT_LOG:
                         log_motion_event(config.EVENT_LOG_FILE, snapshot_path, video_path)
@@ -687,7 +904,7 @@ def run() -> None:
                     cooldown=cooldown,
                     is_recording=recorder.is_recording if recorder else False,
                     mode=mode,
-                    analysis=last_analysis,
+                    analysis=latest_analysis.get(),
                 )
                 cv2.imshow(config.WINDOW_TITLE, display)
                 key = cv2.waitKey(1) & 0xFF
@@ -699,6 +916,7 @@ def run() -> None:
         log.info("Interrupted — shutting down.")
 
     finally:
+        worker.stop()
         if recorder and recorder.is_recording:
             recorder.stop()
         if cap:
