@@ -1,76 +1,19 @@
-"""Detect and recognise your face from a webcam.
+"""Command-line interface.
 
-    python face_detect.py enroll --name Me     # capture your face (look at the camera)
-    python face_detect.py run                  # live detection + recognition
-    python face_detect.py image photo.jpg      # check a single image
-
-Uses OpenCV's YuNet (detection) and SFace (recognition) models, which are
-downloaded automatically on first run into ./models.
+    python -m facecam enroll --name Me     # capture your face (look at the camera)
+    python -m facecam run                  # live detection + recognition
+    python -m facecam image photo.jpg      # check a single image
 """
 import argparse
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-MODELS = Path("models")
-DB = Path("faces.npz")
-URLS = {
-    "yunet.onnx": "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
-    "sface.onnx": "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx",
-}
-MATCH_THRESHOLD = 0.363  # SFace cosine threshold recommended by OpenCV
-ENROLL_SAMPLES = 15
-
-
-def fetch_models():
-    MODELS.mkdir(exist_ok=True)
-    for name, url in URLS.items():
-        path = MODELS / name
-        if not path.exists() or path.stat().st_size < 10_000:
-            print(f"Downloading {name} ...")
-            urllib.request.urlretrieve(url, path)
-    return str(MODELS / "yunet.onnx"), str(MODELS / "sface.onnx")
-
-
-def load_models():
-    det_path, rec_path = fetch_models()
-    detector = cv2.FaceDetectorYN.create(det_path, "", (320, 320), 0.8, 0.3, 5000)
-    recognizer = cv2.FaceRecognizerSF.create(rec_path, "")
-    return detector, recognizer
-
-
-def detect(detector, frame):
-    h, w = frame.shape[:2]
-    detector.setInputSize((w, h))
-    _, faces = detector.detect(frame)
-    return [] if faces is None else faces
-
-
-def embed(recognizer, frame, face):
-    return recognizer.feature(recognizer.alignCrop(frame, face))
-
-
-def load_db():
-    if not DB.exists():
-        return {}
-    data = np.load(DB, allow_pickle=False)
-    return {k: data[k] for k in data.files}
-
-
-def identify(recognizer, feat, db):
-    """Return (name, best_score). name is None if nobody matches."""
-    best_name, best = None, -1.0
-    for name, samples in db.items():
-        for ref in samples:
-            s = recognizer.match(feat, ref.reshape(1, -1), cv2.FaceRecognizerSF_FR_COSINE)
-            if s > best:
-                best_name, best = name, s
-    return (best_name if best >= MATCH_THRESHOLD else None), best
-
+from .config import DB_PATH, ENROLL_SAMPLES, MIN_ENROLL_CONFIDENCE
+from .models import detect, embed, identify, load_db, load_models, save_db
 
 def draw(frame, face, label, color):
     x, y, w, h = face[:4].astype(int)
@@ -98,7 +41,7 @@ def cmd_enroll(args):
             break
         faces = detect(detector, frame)
         # Only enroll when exactly one clear face is visible.
-        if len(faces) == 1 and faces[0][-1] > 0.9 and time.time() - last > 0.4:
+        if len(faces) == 1 and faces[0][-1] > MIN_ENROLL_CONFIDENCE and time.time() - last > 0.4:
             samples.append(embed(recognizer, frame, faces[0])[0])
             last = time.time()
         for f in faces:
@@ -112,15 +55,15 @@ def cmd_enroll(args):
         sys.exit("Enrollment incomplete; nothing saved.")
     db = load_db()
     db[args.name] = np.array(samples)
-    np.savez(DB, **db)
-    print(f"Saved {len(samples)} samples for '{args.name}' to {DB}")
+    save_db(db)
+    print(f"Saved {len(samples)} samples for '{args.name}' to {DB_PATH}")
 
 
 def cmd_run(args):
     detector, recognizer = load_models()
     db = load_db()
     if not db:
-        sys.exit("No enrolled faces. Run: python face_detect.py enroll --name Me")
+        sys.exit("No enrolled faces. Run: python -m facecam enroll --name Me")
     cap = open_camera(args.camera)
     print("Press q to quit.")
     while True:

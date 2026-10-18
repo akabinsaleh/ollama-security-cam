@@ -1,4 +1,4 @@
 models/
-faces.npz
+data/
 *.out.jpg
 __pycache__/
