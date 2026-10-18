@@ -71,7 +71,7 @@ VIDEO_POST_MOTION_SECONDS = 5.0   # keep recording this long after motion stops
 VIDEO_FPS                 = 20.0  # playback framerate for saved .avi clips
 
 # --- Sound alert ---
-# Play a short beep through the PC speaker when an alert fires.
+# Play a short beep through the PC speaker when a notification fires.
 # Works on Windows only; silently ignored on other platforms.
 SOUND_ALERT = True
 
@@ -80,14 +80,36 @@ SOUND_ALERT = True
 SAVE_EVENT_LOG = True
 EVENT_LOG_FILE = "motion_events.log"   # relative to working directory
 
-# --- AI appearance analysis ---
-# When True, each snapshot is sent to Claude vision to describe what the
-# person is wearing and any other visible details.  The result appears on
-# the live feed and is saved to the admin dashboard.
-# Requires:  pip install anthropic
+# --- Local AI analysis (Ollama) ---
+# When True, each snapshot is sent to a vision model running in your own
+# Ollama install.  Nothing leaves your PC and there is no API cost.
+# The model answers: is a real person visible, how sure (0-100), and what
+# they look like.  The result appears on the live feed and in the dashboard.
+# When False, every confirmed detection notifies you without an AI check.
 ANALYZE_APPEARANCE = True
-ANTHROPIC_API_KEY  = "your-anthropic-api-key-here"   # <-- change me
-#   Get a key at https://console.anthropic.com/
+
+OLLAMA_URL        = "http://localhost:11434"
+OLLAMA_MODEL      = "qwen3.5:4b"   # must have the "vision" capability (ollama show <model>)
+OLLAMA_TIMEOUT    = 180            # seconds to wait for one answer (CPU-only PCs are slow)
+OLLAMA_KEEP_ALIVE = "30m"          # keep the model loaded in memory between events
+OLLAMA_THINK      = False          # False = skip "thinking" mode, much faster
+OLLAMA_IMAGE_WIDTH = 640           # snapshot is shrunk to this width before sending
+
+# --- Person notification ---
+# A notification fires only when the AI says a person is present AND its
+# confidence (0-100) is at least this value.  Tune it on your own test data.
+PERSON_CONFIDENCE_THRESHOLD = 60
+
+# If Ollama is off, times out, or gives an unreadable answer, still notify
+# (a missed intruder is worse than a false alarm).  Set False to stay silent.
+NOTIFY_ON_AI_FAILURE = True
+
+# Show a Windows desktop toast notification.  Needs:  pip install winotify
+NOTIFY_DESKTOP = True
+
+# Max snapshots waiting for the AI.  If the AI is slower than events arrive,
+# extra events are saved and notified without analysis instead of piling up.
+AI_QUEUE_SIZE = 8
 
 # --- Display ---
 SHOW_LIVE_FEED = True       # Set False to run headless (no window)
