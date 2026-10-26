@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>facecam white paper</title>
+<style>
+@page{size:Letter;margin:0.7in}
+body{font:10.5pt/1.45 Georgia,serif;color:#1a1a1a;margin:0}
+h1{font:700 22pt Helvetica,Arial,sans-serif;margin:0 0 2pt}
+.sub{font:11pt Helvetica,Arial,sans-serif;color:#555;margin-bottom:10pt}
+h2{font:700 12.5pt Helvetica,Arial,sans-serif;margin:13pt 0 3pt;color:#14406b;border-bottom:1px solid #ccd;padding-bottom:2pt}
+p{margin:0 0 6pt;text-align:justify} ul{margin:0 0 6pt;padding-left:18pt} li{margin-bottom:2pt}
+table{border-collapse:collapse;width:100%;font:9.5pt Helvetica,Arial,sans-serif;margin:4pt 0 8pt}
+td,th{border:1px solid #bbb;padding:3pt 6pt;text-align:left;vertical-align:top} th{background:#eef2f7}
+pre{font:8.5pt/1.3 Menlo,Consolas,monospace;background:#f5f5f5;padding:6pt;margin:4pt 0 8pt}
+.break{page-break-before:always}
+</style></head><body>
+<h1>facecam</h1>
+<div class="sub">A lightweight, local face detection and recognition tool &middot; White paper &middot; October 2026</div>
+
+<h2>1. Summary</h2>
+<p>facecam is a small Python program that detects faces in a webcam stream or photo and decides whether each face belongs to an enrolled person, such as its owner. It runs entirely on the user's own computer: no cloud service, account or network connection is needed after two small model files are downloaded once. It is built on OpenCV and two compact pretrained neural networks, which keeps installation to a single <code>pip install</code> and lets it run on an ordinary laptop CPU.</p>
+
+<h2>2. Problem and goals</h2>
+<p>Face recognition tools are often heavy to install (compiled dependencies such as dlib), tied to paid cloud APIs, or opaque about where face data goes. facecam targets a different point in the design space:</p>
+<ul>
+<li><b>Accurate</b> &mdash; use modern, purpose-built detection and recognition models rather than classical Haar cascades.</li>
+<li><b>Private</b> &mdash; all processing and storage stay on the local machine.</li>
+<li><b>Simple</b> &mdash; two dependencies (OpenCV, NumPy) and three commands.</li>
+<li><b>Understandable</b> &mdash; roughly 250 lines of readable code split into three modules.</li>
+</ul>
+
+<h2>3. How it works</h2>
+<p>Each video frame passes through a three-stage pipeline:</p>
+<table>
+<tr><th>Stage</th><th>Component</th><th>What it does</th></tr>
+<tr><td>1. Detect</td><td>YuNet</td><td>Finds faces and returns a bounding box, five landmarks (eyes, nose, mouth corners) and a confidence score.</td></tr>
+<tr><td>2. Embed</td><td>SFace</td><td>Uses the landmarks to align and crop the face, then converts it into a 128-number vector (an <i>embedding</i>) that captures identity rather than pose or lighting.</td></tr>
+<tr><td>3. Match</td><td>Cosine similarity</td><td>Compares the vector against stored embeddings of enrolled people. A score at or above 0.363 (the threshold recommended by OpenCV for SFace) counts as a match; otherwise the face is labelled <i>Unknown</i>.</td></tr>
+</table>
+<p><b>Enrollment.</b> The user looks at the camera while the program captures 15 samples over a few seconds. A sample is accepted only when exactly one face is visible with detection confidence above 0.9, which prevents bystanders or poor detections from polluting the database. Multiple samples across slight head movement make matching more robust than a single photo. Only the embeddings are saved (<code>data/faces.npz</code>); no images are stored.</p>
+
+<div class="break"></div>
+<h2>4. Usage and architecture</h2>
+<pre>pip install -r requirements.txt
+python -m facecam enroll --name Me   # capture 15 samples
+python -m facecam run                # live view: green = match, red = Unknown
+python -m facecam image photo.jpg    # annotate a single photo</pre>
+<table>
+<tr><th>Module</th><th>Responsibility</th></tr>
+<tr><td><code>facecam/cli.py</code></td><td>Command-line commands (enroll, run, image) and on-screen drawing.</td></tr>
+<tr><td><code>facecam/models.py</code></td><td>Model download and loading; detect, embed and identify functions; reading and writing the face database.</td></tr>
+<tr><td><code>facecam/config.py</code></td><td>Paths, model URLs and tunable thresholds in one place.</td></tr>
+</table>
+
+<h2>5. Privacy and security considerations</h2>
+<ul>
+<li><b>Local only.</b> Video never leaves the machine. The only network use is the one-time model download from the OpenCV Zoo repository on GitHub.</li>
+<li><b>Embeddings, not photos.</b> The database holds numeric vectors. These are still biometric data and should be treated as sensitive; the <code>data/</code> folder is excluded from version control for this reason.</li>
+<li><b>Not a security lock.</b> A printed photo or a screen replay can fool a system without liveness detection. facecam must not be used as the sole control protecting anything valuable.</li>
+<li><b>Consent.</b> Enroll only people who have agreed to it, and check local law before recognising other people's faces.</li>
+</ul>
+
+<h2>6. Limitations</h2>
+<ul>
+<li><b>No formal accuracy benchmark yet.</b> The models are published, pretrained components, but this project has not measured its own false-accept and false-reject rates. Results depend on camera quality, lighting and angle.</li>
+<li><b>No liveness / anti-spoofing</b> (see above).</li>
+<li><b>CPU-only, per-frame processing.</b> Speed depends on the machine and image resolution; there is no tracking between frames.</li>
+<li><b>Threshold is global.</b> One cutoff applies to everyone; it should be tuned for the user's own environment.</li>
+</ul>
+
+<h2>7. Roadmap</h2>
+<ul>
+<li>A small evaluation script that reports false-accept / false-reject rates on the user's own photos, so the threshold can be tuned with evidence.</li>
+<li>Optional liveness checks (blink or head-turn challenge) to resist photo attacks.</li>
+<li>Logging of recognition events with timestamps and optional snapshots of unknown faces, supporting the security-camera use case the project began with.</li>
+<li>Frame skipping and face tracking for lower CPU use on small devices.</li>
+</ul>
+
+<h2>8. Conclusion</h2>
+<p>facecam shows that accurate face recognition does not require a cloud service or a complex stack. By combining two compact pretrained models with a clean, small codebase, it gives individuals a private, inspectable tool for recognising their own face. Its main open items are measuring accuracy and adding spoofing resistance before it is relied on for anything security-critical.</p>
+</body></html>
