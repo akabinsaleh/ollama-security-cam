@@ -7,7 +7,7 @@ h1{font:700 21pt Helvetica,Arial,sans-serif;margin:0 0 2pt}
 .sub{font:10.5pt Helvetica,Arial,sans-serif;color:#555;margin-bottom:8pt}
 h2{font:700 12pt Helvetica,Arial,sans-serif;margin:9pt 0 3pt;color:#14406b;border-bottom:1px solid #ccd;padding-bottom:2pt}
 p{margin:0 0 5pt;text-align:justify} ul{margin:0 0 5pt;padding-left:18pt} li{margin-bottom:2pt}
-table{border-collapse:collapse;width:100%;font:9pt Helvetica,Arial,sans-serif;margin:4pt 0 7pt}
+tr{page-break-inside:avoid}h2{page-break-after:avoid}table{border-collapse:collapse;width:100%;font:9pt Helvetica,Arial,sans-serif;margin:4pt 0 7pt}
 td,th{border:1px solid #bbb;padding:3pt 6pt;text-align:left;vertical-align:top} th{background:#eef2f7}
 pre{font:8pt/1.25 Menlo,Consolas,monospace;background:#f5f5f5;padding:6pt;margin:4pt 0 7pt}
 .flow{display:flex;align-items:stretch;gap:0;margin:6pt 0 8pt;font:8.5pt Helvetica,Arial,sans-serif}
@@ -49,7 +49,7 @@ pre{font:8pt/1.25 Menlo,Consolas,monospace;background:#f5f5f5;padding:6pt;margin
 <tr><td>Fastest fallback</td><td>Moondream 2</td><td>Around 2B parameters, very quick, suited to weak machines; less reliable on small or partly hidden people.</td></tr>
 <tr><td>Higher accuracy</td><td>Qwen2.5-VL 7B</td><td>Better on dark or cluttered scenes if a GPU is available; slower.</td></tr>
 </table>
-<p><b>This ranking is a starting recommendation, not a measured result.</b> The right choice depends on the user's hardware, so the project should include a small benchmark (section 6) that times each model and scores it on the user's own camera images before one is fixed as the default.</p>
+<p><b>This ranking is a starting recommendation, not a measured result.</b> The right choice depends on the user's hardware, so the project should include a small benchmark (see Test plan) that times each model and scores it on the user's own camera images before one is fixed as the default.</p>
 
 <div class="break"></div>
 <h2>4. Why a local LLM instead of a cloud API</h2>
@@ -63,7 +63,29 @@ pre{font:8pt/1.25 Menlo,Consolas,monospace;background:#f5f5f5;padding:6pt;margin
 </table>
 <p><b>Trade-offs.</b> Small local models are generally less accurate than the largest cloud models, and local speed depends on the computer; this is why the benchmark in section 6 matters. Local also does not mean automatically secure: recordings sit on the owner's disk and need encryption and automatic deletion of old clips. Notification services are still third parties, so the owner can choose text-only alerts and keep snapshots and video on the machine.</p>
 
-<h2>5. Design details that make it reliable</h2>
+<h2>5. Why this combination: a Python library plus a local LLM</h2>
+<p>Neither half is enough alone, so facecam splits the job between them:</p>
+<table>
+<tr><th style="width:21%">Approach</th><th>Strengths</th><th>Weaknesses</th></tr>
+<tr><td>Python library only (OpenCV motion detection)</td><td>Very fast, tiny CPU use, runs on every frame.</td><td>Cannot tell a person from a pet, shadow, curtain or headlights, so it produces many false alarms.</td></tr>
+<tr><td>Python library with a trained detector (e.g. YOLO)</td><td>Fast and good at the narrow question &ldquo;is there a person?&rdquo;.</td><td>Gives a label and box, not an understanding of the scene; new needs (&ldquo;someone carrying a box&rdquo;) mean retraining or new models.</td></tr>
+<tr><td>LLM only (every frame)</td><td>Understands the scene and can explain it in words.</td><td>Far too slow and power-hungry to run on a continuous video stream.</td></tr>
+<tr><td><b>Library + local LLM (chosen)</b></td><td>The library does what it is best at: continuous, cheap watching, recording and orchestration. The LLM looks only at the few frames that matter, and returns a confidence plus a plain-language description that goes into the alert. Behaviour changes by editing the prompt, not by retraining.</td><td>More moving parts; the LLM is slower than a detector on the single frame it checks, and its confidence is self-reported.</td></tr>
+</table>
+<p>If testing shows that only a yes/no person answer is needed, a dedicated detector such as YOLO could replace or back up the LLM. The benchmark is designed to compare them.</p>
+
+<h2>6. Hardware needed</h2>
+<p>The local model is served by <b>Ollama</b>, a free tool that runs open models on the owner's computer and exposes them on <code>localhost</code>. Sizes below are approximate and should be checked against the models actually installed.</p>
+<table>
+<tr><th style="width:18%">Item</th><th>Minimum</th><th>Recommended</th></tr>
+<tr><td>Computer</td><td>Modern laptop or mini PC, 4 cores, 8 GB RAM, running Moondream 2 (slow but usable).</td><td>16 GB RAM and a GPU with 6&ndash;8 GB of memory (or an Apple-silicon Mac) for Qwen2.5-VL 3B or 7B.</td></tr>
+<tr><td>Camera</td><td>USB webcam, 720p.</td><td>1080p IP camera (RTSP) with infrared night vision, mounted with a clear view of the entrance.</td></tr>
+<tr><td>Storage</td><td>Tens of GB for models and clips.</td><td>An encrypted SSD or drive of 256 GB or more; video is recorded only on confirmed events, so use is far below continuous recording.</td></tr>
+<tr><td>Network</td><td>None for detection; internet only to send alerts.</td><td>A wired link to IP cameras for reliability.</td></tr>
+<tr><td>Always-on</td><td>The computer must stay powered on and awake.</td><td>A small dedicated machine, ideally on a UPS.</td></tr>
+</table>
+
+<h2>7. Design details that make it reliable</h2>
 <ul>
 <li><b>Confidence is self-reported.</b> A language model does not produce a calibrated probability; the number is its own estimate. It is useful for ranking and thresholding but should be tuned against real events, and treated as a guide rather than a guarantee.</li>
 <li><b>False alarms.</b> Pets, shadows and headlights cause motion without a person; the LLM step rejects these, and the threshold sets the balance between missed people and false alerts.</li>
@@ -71,7 +93,20 @@ pre{font:8pt/1.25 Menlo,Consolas,monospace;background:#f5f5f5;padding:6pt;margin
 <li><b>Timeouts.</b> If the LLM is too slow, fall back to the faster model or send an &ldquo;unverified motion&rdquo; alert, so no event is silently lost.</li>
 </ul>
 
-<h2>6. Proposed code layout</h2>
+<h2>8. Test plan</h2>
+<p>The goal is evidence for the model choice and the confidence threshold, not impressions.</p>
+<table>
+<tr><th style="width:21%">Test</th><th>Method</th><th>Measure</th></tr>
+<tr><td>Accuracy</td><td>Collect a few hundred labelled snapshots from the real camera (person / no person) and run each candidate model over them.</td><td>Missed-person rate, false-alert rate, and accuracy at each confidence threshold.</td></tr>
+<tr><td>Scenarios</td><td>Day, night, rain, backlight, headlights, pets, a person far away, partly hidden or crouching, a person who is the owner.</td><td>Results per scenario, to find the weak spots.</td></tr>
+<tr><td>Speed</td><td>Time each step for each model on the target computer.</td><td>Motion-to-alert time (median and slowest 5%), per-step breakdown.</td></tr>
+<tr><td>Comparison</td><td>Run the same images through a YOLO detector.</td><td>Whether the LLM beats it enough to justify the extra cost.</td></tr>
+<tr><td>Reliability</td><td>24-hour soak test; unplug the camera; stop Ollama; cut the internet; send malformed model replies.</td><td>No crashes, no lost events, correct fallback behaviour.</td></tr>
+<tr><td>Privacy</td><td>Watch outgoing network traffic during a run.</td><td>Only the configured notification leaves the machine.</td></tr>
+</table>
+<p>Pass/fail targets (for example the highest acceptable missed-person rate and slowest acceptable alert time) are set by the owner before testing begins, then the threshold is tuned and the tests repeated.</p>
+
+<h2>9. Proposed code layout</h2>
 <pre>facecam/
   camera.py     read frames, rolling pre-roll buffer
   motion.py     background subtraction, cooldown
@@ -81,13 +116,13 @@ pre{font:8pt/1.25 Menlo,Consolas,monospace;background:#f5f5f5;padding:6pt;margin
   cli.py / config.py   commands, thresholds, model, settings</pre>
 <p>A <code>benchmark</code> command would run each candidate model over a folder of labelled images (person / no person) and report response time and the false-alert and missed-person rates, giving evidence for the model choice and threshold.</p>
 
-<h2>7. Privacy, security and limits</h2>
+<h2>10. Privacy, security and limits</h2>
 <ul>
 <li><b>Local first.</b> Frames, snapshots, recordings and LLM inference all stay on the machine. The only outbound data is the notification the owner configures; an alert can be sent as text only if the owner prefers.</li>
 <li><b>Sensitive data.</b> Recordings and face data are personal data. Use an encrypted disk, restrict access, delete old clips automatically, and only film where the law and consent allow.</li>
 <li><b>Not a guarantee.</b> A vision model can miss a person or be fooled. Treat facecam as an extra layer, not the only protection for anything valuable. Its accuracy has not yet been benchmarked.</li>
 </ul>
 
-<h2>8. Status</h2>
+<h2>11. Status</h2>
 <p>The repository currently contains face detection and recognition. The pipeline above is the design for the next stage, built in this order: motion and snapshot, LLM call, recording, notifications, benchmark, optional face check.</p>
 </body></html>
