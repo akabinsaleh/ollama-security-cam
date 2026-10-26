@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>facecam white paper</title>
 <style>
-@page{size:Letter;margin:0.65in}
+@page{size:Letter;margin:0.6in}
 body{font:9.8pt/1.38 Georgia,serif;color:#1a1a1a;margin:0}
 h1{font:700 21pt Helvetica,Arial,sans-serif;margin:0 0 2pt}
 .sub{font:10.5pt Helvetica,Arial,sans-serif;color:#555;margin-bottom:8pt}
@@ -9,7 +9,7 @@ h2{font:700 12pt Helvetica,Arial,sans-serif;margin:9pt 0 3pt;color:#14406b;borde
 p{margin:0 0 5pt;text-align:justify} ul{margin:0 0 5pt;padding-left:18pt} li{margin-bottom:2pt}
 table{border-collapse:collapse;width:100%;font:9pt Helvetica,Arial,sans-serif;margin:4pt 0 7pt}
 td,th{border:1px solid #bbb;padding:3pt 6pt;text-align:left;vertical-align:top} th{background:#eef2f7}
-pre{font:8.3pt/1.3 Menlo,Consolas,monospace;background:#f5f5f5;padding:6pt;margin:4pt 0 7pt}
+pre{font:8pt/1.25 Menlo,Consolas,monospace;background:#f5f5f5;padding:6pt;margin:4pt 0 7pt}
 .flow{display:flex;align-items:stretch;gap:0;margin:6pt 0 8pt;font:8.5pt Helvetica,Arial,sans-serif}
 .flow div{flex:1;border:1px solid #14406b;background:#eef2f7;padding:5pt 4pt;text-align:center;border-radius:3pt}
 .flow span{align-self:center;padding:0 3pt;color:#14406b;font-weight:700}
@@ -49,39 +49,45 @@ pre{font:8.3pt/1.3 Menlo,Consolas,monospace;background:#f5f5f5;padding:6pt;margi
 <tr><td>Fastest fallback</td><td>Moondream 2</td><td>Around 2B parameters, very quick, suited to weak machines; less reliable on small or partly hidden people.</td></tr>
 <tr><td>Higher accuracy</td><td>Qwen2.5-VL 7B</td><td>Better on dark or cluttered scenes if a GPU is available; slower.</td></tr>
 </table>
-<p><b>This ranking is a starting recommendation, not a measured result.</b> The right choice depends on the user's hardware, so the project should include a small benchmark (section 5) that times each model and scores it on the user's own camera images before one is fixed as the default.</p>
+<p><b>This ranking is a starting recommendation, not a measured result.</b> The right choice depends on the user's hardware, so the project should include a small benchmark (section 6) that times each model and scores it on the user's own camera images before one is fixed as the default.</p>
 
 <div class="break"></div>
-<h2>4. Design details that make it reliable</h2>
+<h2>4. Why a local LLM instead of a cloud API</h2>
+<table>
+<tr><th style="width:17%">Reason</th><th>Local LLM</th><th>Cloud API (e.g. Claude API)</th></tr>
+<tr><td>Privacy</td><td>Images stay on the owner's machine and are never handed to a third party.</td><td>Every snapshot is uploaded to the provider's servers.</td></tr>
+<tr><td>Cost</td><td>No per-image fee after the hardware is bought.</td><td>Billed per image, which adds up quickly on a busy camera.</td></tr>
+<tr><td>Response time</td><td>No upload or network round trip; speed depends on the local hardware.</td><td>Adds upload time and network delay to every check.</td></tr>
+<tr><td>Availability</td><td>Works with the internet down, when a camera is needed most.</td><td>Stops working without a connection or during an outage.</td></tr>
+<tr><td>Control</td><td>The owner chooses the model, version and settings, and nothing changes unannounced.</td><td>Model, limits and pricing are set by the provider.</td></tr>
+</table>
+<p><b>Trade-offs.</b> Small local models are generally less accurate than the largest cloud models, and local speed depends on the computer; this is why the benchmark in section 6 matters. Local also does not mean automatically secure: recordings sit on the owner's disk and need encryption and automatic deletion of old clips. Notification services are still third parties, so the owner can choose text-only alerts and keep snapshots and video on the machine.</p>
+
+<h2>5. Design details that make it reliable</h2>
 <ul>
 <li><b>Confidence is self-reported.</b> A language model does not produce a calibrated probability; the number is its own estimate. It is useful for ranking and thresholding but should be tuned against real events, and treated as a guide rather than a guarantee.</li>
-<li><b>Two-stage by design.</b> Motion detection filters out the vast majority of frames, so the slower LLM runs only on a handful of images. This is what makes a local LLM fast enough for real-time use.</li>
-<li><b>False alarms.</b> Pets, shadows, curtains and headlights cause motion without a person. The LLM step exists to reject these; the confidence threshold sets the trade-off between missed people and false alerts.</li>
+<li><b>False alarms.</b> Pets, shadows and headlights cause motion without a person; the LLM step rejects these, and the threshold sets the balance between missed people and false alerts.</li>
 <li><b>Optional face check.</b> The existing facecam modules (YuNet detection, SFace recognition) can run on the confirmed snapshot to tell the owner from a stranger, so the owner is not alerted about themselves.</li>
-<li><b>Timeouts and fallbacks.</b> If the LLM does not answer within a few seconds, the system falls back to the faster model or, as a last resort, sends a "motion detected, unverified" alert so an event is never silently lost.</li>
-<li><b>Event log.</b> Every event (time, snapshot, model reply, decision, recording path) is written to a local log for later review and threshold tuning.</li>
+<li><b>Timeouts.</b> If the LLM is too slow, fall back to the faster model or send an &ldquo;unverified motion&rdquo; alert, so no event is silently lost.</li>
 </ul>
 
-<h2>5. Proposed code layout</h2>
+<h2>6. Proposed code layout</h2>
 <pre>facecam/
   camera.py     read frames, rolling pre-roll buffer
   motion.py     background subtraction, cooldown
   vision.py     send snapshot to local LLM, parse JSON reply
-  recorder.py   write MP4 clips
-  notify.py     ntfy / Telegram / email alerts
+  recorder.py / notify.py   MP4 clips, alerts
   pipeline.py   ties the steps together (main loop)
-  cli.py        run, enroll, image, benchmark
-  config.py     thresholds, model name, notification settings</pre>
+  cli.py / config.py   commands, thresholds, model, settings</pre>
 <p>A <code>benchmark</code> command would run each candidate model over a folder of labelled images (person / no person) and report response time and the false-alert and missed-person rates, giving evidence for the model choice and threshold.</p>
 
-<h2>6. Privacy, security and limits</h2>
+<h2>7. Privacy, security and limits</h2>
 <ul>
 <li><b>Local first.</b> Frames, snapshots, recordings and LLM inference all stay on the machine. The only outbound data is the notification the owner configures; an alert can be sent as text only if the owner prefers.</li>
-<li><b>Sensitive data.</b> Recordings and face data are personal data. Store them on an encrypted disk, restrict access, and delete old clips automatically.</li>
-<li><b>Lawful use.</b> Only film places and people where the law and consent allow it.</li>
+<li><b>Sensitive data.</b> Recordings and face data are personal data. Use an encrypted disk, restrict access, delete old clips automatically, and only film where the law and consent allow.</li>
 <li><b>Not a guarantee.</b> A vision model can miss a person or be fooled. Treat facecam as an extra layer, not the only protection for anything valuable. Its accuracy has not yet been benchmarked.</li>
 </ul>
 
-<h2>7. Status and next steps</h2>
-<p>Today the repository contains the face detection and recognition modules (enroll, run, image). The camera-to-alert pipeline described here is the design for the next stage. Proposed order of work: (1) motion detection and snapshot, (2) local LLM call with JSON parsing, (3) recording with pre-roll, (4) notifications, (5) benchmark command, (6) optional face check.</p>
+<h2>8. Status</h2>
+<p>The repository currently contains face detection and recognition. The pipeline above is the design for the next stage, built in this order: motion and snapshot, LLM call, recording, notifications, benchmark, optional face check.</p>
 </body></html>
