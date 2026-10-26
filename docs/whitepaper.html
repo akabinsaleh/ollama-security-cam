@@ -1,79 +1,87 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>facecam white paper</title>
 <style>
-@page{size:Letter;margin:0.7in}
-body{font:10.5pt/1.45 Georgia,serif;color:#1a1a1a;margin:0}
-h1{font:700 22pt Helvetica,Arial,sans-serif;margin:0 0 2pt}
-.sub{font:11pt Helvetica,Arial,sans-serif;color:#555;margin-bottom:10pt}
-h2{font:700 12.5pt Helvetica,Arial,sans-serif;margin:13pt 0 3pt;color:#14406b;border-bottom:1px solid #ccd;padding-bottom:2pt}
-p{margin:0 0 6pt;text-align:justify} ul{margin:0 0 6pt;padding-left:18pt} li{margin-bottom:2pt}
-table{border-collapse:collapse;width:100%;font:9.5pt Helvetica,Arial,sans-serif;margin:4pt 0 8pt}
+@page{size:Letter;margin:0.65in}
+body{font:9.8pt/1.38 Georgia,serif;color:#1a1a1a;margin:0}
+h1{font:700 21pt Helvetica,Arial,sans-serif;margin:0 0 2pt}
+.sub{font:10.5pt Helvetica,Arial,sans-serif;color:#555;margin-bottom:8pt}
+h2{font:700 12pt Helvetica,Arial,sans-serif;margin:9pt 0 3pt;color:#14406b;border-bottom:1px solid #ccd;padding-bottom:2pt}
+p{margin:0 0 5pt;text-align:justify} ul{margin:0 0 5pt;padding-left:18pt} li{margin-bottom:2pt}
+table{border-collapse:collapse;width:100%;font:9pt Helvetica,Arial,sans-serif;margin:4pt 0 7pt}
 td,th{border:1px solid #bbb;padding:3pt 6pt;text-align:left;vertical-align:top} th{background:#eef2f7}
-pre{font:8.5pt/1.3 Menlo,Consolas,monospace;background:#f5f5f5;padding:6pt;margin:4pt 0 8pt}
+pre{font:8.3pt/1.3 Menlo,Consolas,monospace;background:#f5f5f5;padding:6pt;margin:4pt 0 7pt}
+.flow{display:flex;align-items:stretch;gap:0;margin:6pt 0 8pt;font:8.5pt Helvetica,Arial,sans-serif}
+.flow div{flex:1;border:1px solid #14406b;background:#eef2f7;padding:5pt 4pt;text-align:center;border-radius:3pt}
+.flow span{align-self:center;padding:0 3pt;color:#14406b;font-weight:700}
+.flow b{display:block;color:#14406b}
 .break{page-break-before:always}
 </style></head><body>
 <h1>facecam</h1>
-<div class="sub">A lightweight, local face detection and recognition tool &middot; White paper &middot; October 2026</div>
+<div class="sub">Camera &rarr; motion &rarr; local vision LLM &rarr; recording + alert &middot; White paper &middot; October 2026</div>
 
 <h2>1. Summary</h2>
-<p>facecam is a small Python program that detects faces in a webcam stream or photo and decides whether each face belongs to an enrolled person, such as its owner. It runs entirely on the user's own computer: no cloud service, account or network connection is needed after two small model files are downloaded once. It is built on OpenCV and two compact pretrained neural networks, which keeps installation to a single <code>pip install</code> and lets it run on an ordinary laptop CPU.</p>
+<p>facecam is a Python security-camera system that runs entirely on the owner's own computer. A camera is watched continuously with cheap motion detection. Only when something moves is a single image sent to a <b>local vision-language model (LLM)</b>, which says whether a person is in the picture and how sure it is. If a person is confirmed, the Python program saves a video recording and sends a notification to the owner. No image or video leaves the machine except the alert the owner chooses to receive.</p>
 
-<h2>2. Problem and goals</h2>
-<p>Face recognition tools are often heavy to install (compiled dependencies such as dlib), tied to paid cloud APIs, or opaque about where face data goes. facecam targets a different point in the design space:</p>
-<ul>
-<li><b>Accurate</b> &mdash; use modern, purpose-built detection and recognition models rather than classical Haar cascades.</li>
-<li><b>Private</b> &mdash; all processing and storage stay on the local machine.</li>
-<li><b>Simple</b> &mdash; two dependencies (OpenCV, NumPy) and three commands.</li>
-<li><b>Understandable</b> &mdash; roughly 250 lines of readable code split into three modules.</li>
-</ul>
-
-<h2>3. How it works</h2>
-<p>Each video frame passes through a three-stage pipeline:</p>
+<h2>2. The whole process</h2>
+<div class="flow">
+<div><b>1. Camera</b>OpenCV reads frames</div><span>&rarr;</span>
+<div><b>2. Motion</b>frame difference</div><span>&rarr;</span>
+<div><b>3. Snapshot</b>best frame saved</div><span>&rarr;</span>
+<div><b>4. Local LLM</b>person? + confidence</div><span>&rarr;</span>
+<div><b>5. Decision</b>Python checks threshold</div><span>&rarr;</span>
+<div><b>6. Act</b>save video + notify</div>
+</div>
 <table>
-<tr><th>Stage</th><th>Component</th><th>What it does</th></tr>
-<tr><td>1. Detect</td><td>YuNet</td><td>Finds faces and returns a bounding box, five landmarks (eyes, nose, mouth corners) and a confidence score.</td></tr>
-<tr><td>2. Embed</td><td>SFace</td><td>Uses the landmarks to align and crop the face, then converts it into a 128-number vector (an <i>embedding</i>) that captures identity rather than pose or lighting.</td></tr>
-<tr><td>3. Match</td><td>Cosine similarity</td><td>Compares the vector against stored embeddings of enrolled people. A score at or above 0.363 (the threshold recommended by OpenCV for SFace) counts as a match; otherwise the face is labelled <i>Unknown</i>.</td></tr>
+<tr><th style="width:17%">Step</th><th>What happens</th></tr>
+<tr><td>1. Camera</td><td>OpenCV (<code>cv2.VideoCapture</code>) reads frames from the webcam or an IP camera. A small rolling buffer keeps the last few seconds in memory, so the recording can include the moments <i>before</i> motion was noticed.</td></tr>
+<tr><td>2. Motion detection</td><td>Each frame is shrunk, blurred and compared with a background model (OpenCV background subtraction). If enough pixels change, motion is declared. This step is very cheap, so it runs on every frame and keeps the LLM idle most of the time. A cooldown (for example 5&ndash;10 seconds) stops one event from triggering many LLM calls.</td></tr>
+<tr><td>3. Snapshot</td><td>When motion starts, the sharpest recent frame is selected and saved as a JPEG, resized to the model's preferred input size to keep inference fast.</td></tr>
+<tr><td>4. Local LLM</td><td>The image is sent to a vision model running on the same computer (served by Ollama on <code>localhost</code>). The prompt asks for strict JSON only: <code>{"person": true/false, "confidence": 0.0&ndash;1.0, "description": "..."}</code>. The reply is the <b>accuracy ratio</b> the system acts on.</td></tr>
+<tr><td>5. Decision</td><td>Python parses the JSON. If <code>person</code> is true and <code>confidence</code> is at or above a set threshold (default 0.6), the event is confirmed. Malformed or timed-out replies are treated as "no decision" and logged, never as an alert.</td></tr>
+<tr><td>6. Record and notify</td><td>On confirmation, Python writes the buffered pre-roll plus live frames to an MP4 (<code>cv2.VideoWriter</code>) until motion has stopped for a few seconds. It then sends a notification (phone push via ntfy or Telegram, or email) containing the snapshot, the model's description and its confidence, and the path of the recording.</td></tr>
 </table>
-<p><b>Enrollment.</b> The user looks at the camera while the program captures 15 samples over a few seconds. A sample is accepted only when exactly one face is visible with detection confidence above 0.9, which prevents bystanders or poor detections from polluting the database. Multiple samples across slight head movement make matching more robust than a single photo. Only the embeddings are saved (<code>data/faces.npz</code>); no images are stored.</p>
+
+<h2>3. Choosing the local LLM</h2>
+<p>The goal is the best person-recognition quality with the fastest response, on ordinary hardware. The recommended setup uses two tiers, both small enough to run on a laptop through Ollama:</p>
+<table>
+<tr><th>Role</th><th>Model (suggested)</th><th>Why</th></tr>
+<tr><td>Default</td><td>Qwen2.5-VL 3B</td><td>Strong at following the "reply in JSON" instruction and at describing people in a scene, at a size that stays responsive on CPU or a modest GPU.</td></tr>
+<tr><td>Fastest fallback</td><td>Moondream 2</td><td>Around 2B parameters, very quick, suited to weak machines; less reliable on small or partly hidden people.</td></tr>
+<tr><td>Higher accuracy</td><td>Qwen2.5-VL 7B</td><td>Better on dark or cluttered scenes if a GPU is available; slower.</td></tr>
+</table>
+<p><b>This ranking is a starting recommendation, not a measured result.</b> The right choice depends on the user's hardware, so the project should include a small benchmark (section 5) that times each model and scores it on the user's own camera images before one is fixed as the default.</p>
 
 <div class="break"></div>
-<h2>4. Usage and architecture</h2>
-<pre>pip install -r requirements.txt
-python -m facecam enroll --name Me   # capture 15 samples
-python -m facecam run                # live view: green = match, red = Unknown
-python -m facecam image photo.jpg    # annotate a single photo</pre>
-<table>
-<tr><th>Module</th><th>Responsibility</th></tr>
-<tr><td><code>facecam/cli.py</code></td><td>Command-line commands (enroll, run, image) and on-screen drawing.</td></tr>
-<tr><td><code>facecam/models.py</code></td><td>Model download and loading; detect, embed and identify functions; reading and writing the face database.</td></tr>
-<tr><td><code>facecam/config.py</code></td><td>Paths, model URLs and tunable thresholds in one place.</td></tr>
-</table>
-
-<h2>5. Privacy and security considerations</h2>
+<h2>4. Design details that make it reliable</h2>
 <ul>
-<li><b>Local only.</b> Video never leaves the machine. The only network use is the one-time model download from the OpenCV Zoo repository on GitHub.</li>
-<li><b>Embeddings, not photos.</b> The database holds numeric vectors. These are still biometric data and should be treated as sensitive; the <code>data/</code> folder is excluded from version control for this reason.</li>
-<li><b>Not a security lock.</b> A printed photo or a screen replay can fool a system without liveness detection. facecam must not be used as the sole control protecting anything valuable.</li>
-<li><b>Consent.</b> Enroll only people who have agreed to it, and check local law before recognising other people's faces.</li>
+<li><b>Confidence is self-reported.</b> A language model does not produce a calibrated probability; the number is its own estimate. It is useful for ranking and thresholding but should be tuned against real events, and treated as a guide rather than a guarantee.</li>
+<li><b>Two-stage by design.</b> Motion detection filters out the vast majority of frames, so the slower LLM runs only on a handful of images. This is what makes a local LLM fast enough for real-time use.</li>
+<li><b>False alarms.</b> Pets, shadows, curtains and headlights cause motion without a person. The LLM step exists to reject these; the confidence threshold sets the trade-off between missed people and false alerts.</li>
+<li><b>Optional face check.</b> The existing facecam modules (YuNet detection, SFace recognition) can run on the confirmed snapshot to tell the owner from a stranger, so the owner is not alerted about themselves.</li>
+<li><b>Timeouts and fallbacks.</b> If the LLM does not answer within a few seconds, the system falls back to the faster model or, as a last resort, sends a "motion detected, unverified" alert so an event is never silently lost.</li>
+<li><b>Event log.</b> Every event (time, snapshot, model reply, decision, recording path) is written to a local log for later review and threshold tuning.</li>
 </ul>
 
-<h2>6. Limitations</h2>
+<h2>5. Proposed code layout</h2>
+<pre>facecam/
+  camera.py     read frames, rolling pre-roll buffer
+  motion.py     background subtraction, cooldown
+  vision.py     send snapshot to local LLM, parse JSON reply
+  recorder.py   write MP4 clips
+  notify.py     ntfy / Telegram / email alerts
+  pipeline.py   ties the steps together (main loop)
+  cli.py        run, enroll, image, benchmark
+  config.py     thresholds, model name, notification settings</pre>
+<p>A <code>benchmark</code> command would run each candidate model over a folder of labelled images (person / no person) and report response time and the false-alert and missed-person rates, giving evidence for the model choice and threshold.</p>
+
+<h2>6. Privacy, security and limits</h2>
 <ul>
-<li><b>No formal accuracy benchmark yet.</b> The models are published, pretrained components, but this project has not measured its own false-accept and false-reject rates. Results depend on camera quality, lighting and angle.</li>
-<li><b>No liveness / anti-spoofing</b> (see above).</li>
-<li><b>CPU-only, per-frame processing.</b> Speed depends on the machine and image resolution; there is no tracking between frames.</li>
-<li><b>Threshold is global.</b> One cutoff applies to everyone; it should be tuned for the user's own environment.</li>
+<li><b>Local first.</b> Frames, snapshots, recordings and LLM inference all stay on the machine. The only outbound data is the notification the owner configures; an alert can be sent as text only if the owner prefers.</li>
+<li><b>Sensitive data.</b> Recordings and face data are personal data. Store them on an encrypted disk, restrict access, and delete old clips automatically.</li>
+<li><b>Lawful use.</b> Only film places and people where the law and consent allow it.</li>
+<li><b>Not a guarantee.</b> A vision model can miss a person or be fooled. Treat facecam as an extra layer, not the only protection for anything valuable. Its accuracy has not yet been benchmarked.</li>
 </ul>
 
-<h2>7. Roadmap</h2>
-<ul>
-<li>A small evaluation script that reports false-accept / false-reject rates on the user's own photos, so the threshold can be tuned with evidence.</li>
-<li>Optional liveness checks (blink or head-turn challenge) to resist photo attacks.</li>
-<li>Logging of recognition events with timestamps and optional snapshots of unknown faces, supporting the security-camera use case the project began with.</li>
-<li>Frame skipping and face tracking for lower CPU use on small devices.</li>
-</ul>
-
-<h2>8. Conclusion</h2>
-<p>facecam shows that accurate face recognition does not require a cloud service or a complex stack. By combining two compact pretrained models with a clean, small codebase, it gives individuals a private, inspectable tool for recognising their own face. Its main open items are measuring accuracy and adding spoofing resistance before it is relied on for anything security-critical.</p>
+<h2>7. Status and next steps</h2>
+<p>Today the repository contains the face detection and recognition modules (enroll, run, image). The camera-to-alert pipeline described here is the design for the next stage. Proposed order of work: (1) motion detection and snapshot, (2) local LLM call with JSON parsing, (3) recording with pre-roll, (4) notifications, (5) benchmark command, (6) optional face check.</p>
 </body></html>
